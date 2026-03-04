@@ -1,52 +1,37 @@
-# Python Etl Toolkit
+# Python ETL Toolkit
 
-Lightweight Python ETL toolkit using pandas and DuckDB for small-to-medium pipelines
+Reusable ETL pipeline components for NbS and pharma BI data workflows.
 
 ## Features
-- Data ingestion from CSV/Excel input files
-- Automated analysis and KPI calculation
-- Summary statistics and trend reporting
-- Sample data generator for testing and development
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
+- **Transform pipeline**: configurable step chain (normalize → deduplicate → hash)
+- **Type coercion**: schema-driven column type enforcement
+- **Deduplication**: key-based with removed record tracking
+- **Row hashing**: MD5 hash for CDC (Change Data Capture) incremental loads
+- **Load summary**: post-run report with null counts and dedup stats
 
 ## Quick Start
 
 ```python
 from src.main import ETLToolkit
 
-analyzer = ETLToolkit()
-df = analyzer.load_data("data/sample.csv")
-result = analyzer.analyze(df)
-print(result)
+etl = ETLToolkit(config={"dedup_keys": ["record_id", "period"]})
+
+# Extract
+df = etl.extract("sample_data/nbs_raw_data.csv")
+
+# Transform
+df = etl.transform_pipeline(df, steps=["normalize", "deduplicate", "hash"])
+
+# Coerce types
+df = etl.coerce_types(df, {"area_ha": "float", "carbon_credits_tco2": "float"})
+
+# Load summary
+summary = etl.load_summary(df)
+print(f"Loaded: {summary['records_loaded']} records")
+print(f"Dedup removed: {summary['dedup_removed']}")
 ```
 
-## Data Format
-
-Expected CSV columns: `source, table, rows_loaded, rows_rejected, duration_sec, run_date, status`
-
-## Project Structure
-
+## Running Tests
+```bash
+pytest tests/ -v
 ```
-python-etl-toolkit/
-├── src/
-│   ├── main.py          # Core analysis logic
-│   └── data_generator.py # Sample data generator
-├── data/                # Data directory (gitignored for real data)
-├── examples/            # Usage examples
-├── requirements.txt
-└── README.md
-```
-
-## License
-
-MIT License — free to use, modify, and distribute.
-
-## 🚀 New Features (2026-03-02)
-- Add async pipeline support and data lineage tracking
-- Enhanced error handling and edge case coverage
-- Comprehensive unit tests and integration examples
