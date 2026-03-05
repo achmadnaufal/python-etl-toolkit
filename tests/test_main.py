@@ -94,3 +94,51 @@ class TestTransformPipeline:
         result = etl.transform_pipeline(raw_df, steps=["normalize", "deduplicate", "hash"])
         assert "row_hash" in result.columns
         assert len(result) < len(raw_df)
+
+
+class TestIncrementalLoad:
+    def test_detects_inserts(self, etl, raw_df):
+        existing = raw_df.iloc[:2].copy()
+        result = etl.incremental_load(raw_df, existing)
+        assert isinstance(result["inserts"], pd.DataFrame)
+
+    def test_no_inserts_when_same_data(self, etl, raw_df):
+        result = etl.incremental_load(raw_df, raw_df)
+        # Without keys, uses hash — same data should yield 0 inserts
+        assert len(result["inserts"]) == 0
+
+    def test_returns_dict_with_expected_keys(self, etl, raw_df):
+        existing = raw_df.iloc[:1].copy()
+        result = etl.incremental_load(raw_df, existing)
+        assert all(k in result for k in ["inserts", "updates", "unchanged", "total_new", "total_existing"])
+
+    def test_total_new_matches_input(self, etl, raw_df):
+        existing = pd.DataFrame(columns=raw_df.columns)
+        result = etl.incremental_load(raw_df, existing)
+        assert result["total_new"] == len(raw_df)
+
+
+class TestDataQualityReport:
+    def test_returns_dict(self, etl, raw_df):
+        result = etl.data_quality_report(raw_df)
+        assert isinstance(result, dict)
+
+    def test_quality_score_in_range(self, etl, raw_df):
+        result = etl.data_quality_report(raw_df)
+        assert 0 <= result["quality_score"] <= 100
+
+    def test_has_rule_results(self, etl, raw_df):
+        result = etl.data_quality_report(raw_df)
+        assert isinstance(result["rule_results"], list)
+
+    def test_custom_not_null_rule(self, etl, raw_df):
+        rules = [{"column": "record_id", "rule": "not_null"}]
+        result = etl.data_quality_report(etl.normalize_columns(raw_df), rules=rules)
+        assert result["rule_results"][0]["rule"] == "not_null"
+
+    def test_min_rule(self, etl, raw_df):
+        df = etl.normalize_columns(raw_df)
+        rules = [{"column": "value_usd", "rule": "min", "value": 0}]
+        result = etl.data_quality_report(df, rules=rules)
+        # All values are positive, so should pass
+        assert result["rule_results"][0]["pass"] is True

@@ -247,3 +247,139 @@ class ETLToolkit:
             else:
                 rows.append({"metric": k, "value": v})
         return pd.DataFrame(rows)
+
+
+    def incremental_load(
+        self,
+        df_new: pd.DataFrame,
+        df_existing: pd.DataFrame,
+        key_cols: Optional[List[str]] = None,
+        updated_col: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Perform an incremental load: detect new and changed records (CDC pattern).
+
+        Compares new data against existing using row hashes or updated_at timestamps.
+        Returns inserts (new records) and updates (changed records).
+
+        Args:
+            df_new: Incoming DataFrame with fresh data.
+            df_existing: Current DataFrame representing the target state.
+            key_cols: Primary key columns for record matching.
+            updated_col: Optional timestamp column; if provided, uses timestamp
+                         comparison instead of hash comparison.
+
+        Returns:
+            Dict with:
+                - inserts: DataFrame of new records not in existing
+                - updates: DataFrame of records with changed non-key values
+                - unchanged: count of unchanged records
+                - total_new: count in df_new
+                - total_existing: count in df_existing
+        """
+        df_new = self.preprocess(df_new)
+        df_existing = self.preprocess(df_existing)
+        keys = key_cols or self.dedup_keys
+
+        if not keys:
+            # Without keys, use full hash comparison
+            df_new = self.add_row_hash(df_new)
+            df_existing = self.add_row_hash(df_existing)
+            existing_hashes = set(df_existing["row_hash"])
+            inserts = df_new[~df_new["row_hash"].isin(existing_hashes)].drop(columns=["row_hash"])
+            return {
+                "inserts": inserts.reset_index(drop=True),
+                "updates": pd.DataFrame(),
+                "unchanged": len(df_new) - len(inserts),
+                "total_new": len(df_new),
+                "total_existing": len(df_existing),
+            }
+
+        available_keys = [k for k in keys if k in df_new.columns and k in df_existing.columns]
+        if not available_keys:
+            raise ValueError(f"Key columns {keys} not found in both DataFrames")
+
+        merged = df_new.merge(
+            df_existing, on=available_keys, how="left", suffixes=("_new", "_existing"), indicator=True
+        )
+        inserts = df_new[~df_new[available_keys[0]].isin(df_existing[available_keys[0]])]
+
+        # Detect updates: records that exist but have changed values
+        updates_list = []
+        if updated_col and updated_col in df_new.columns and updated_col in df_existing.columns:
+            common_keys = df_new[available_keys[0]].isin(df_existing[available_keys[0]])
+            new_common = df_new[common_keys].set_index(available_keys[0])
+            exist_common = df_existing.set_index(available_keys[0])
+            for key_val in new_common.index:
+                if key_val in exist_common.index:
+                    new_ts = new_common.loc[key_val, updated_col]
+                    exist_ts = exist_common.loc[key_val, updated_col]
+                    if pd.to_datetime(new_ts) > pd.to_datetime(exist_ts):
+                        updates_list.append(df_new[df_new[available_keys[0]] == key_val])
+
+        updates = pd.concat(updates_list) if updates_list else pd.DataFrame()
+        unchanged = len(df_new) - len(inserts) - len(updates)
+
+        return {
+            "inserts": inserts.reset_index(drop=True),
+            "updates": updates.reset_index(drop=True) if not updates.empty else pd.DataFrame(),
+            "unchanged": max(0, unchanged),
+            "total_new": len(df_new),
+            "total_existing": len(df_existing),
+        }
+
+    def data_quality_report(self, df: pd.DataFrame, rules: Optional[List[Dict]] = None) -> Dict[str, Any]:
+        """
+        Run data quality checks against configurable rules.
+
+        Args:
+            df: DataFrame to validate.
+            rules: List of rule dicts with keys:
+                - column: Column name to check
+                - rule: 'not_null', 'unique', 'min', 'max', 'regex'
+                - value: Threshold value for min/max/regex rules
+
+        Returns:
+            Dict with overall pass/fail, rule results list, and quality score (0-100).
+        """
+        df = self.preprocess(df)
+        if rules is None:
+            rules = [{"column": c, "rule": "not_null"} for c in df.columns]
+
+        results = []
+        for rule in rules:
+            col = rule.get("column", "")
+            r = rule.get("rule", "not_null")
+            val = rule.get("value")
+
+            if col not in df.columns:
+                results.append({"column": col, "rule": r, "pass": False, "detail": "Column not found"})
+                continue
+
+            if r == "not_null":
+                null_count = int(df[col].isnull().sum())
+                results.append({"column": col, "rule": r, "pass": null_count == 0, "detail": f"{null_count} nulls"})
+            elif r == "unique":
+                dup_count = int(df[col].duplicated().sum())
+                results.append({"column": col, "rule": r, "pass": dup_count == 0, "detail": f"{dup_count} duplicates"})
+            elif r == "min" and val is not None:
+                fails = int((pd.to_numeric(df[col], errors="coerce") < val).sum())
+                results.append({"column": col, "rule": f"min>={val}", "pass": fails == 0, "detail": f"{fails} below min"})
+            elif r == "max" and val is not None:
+                fails = int((pd.to_numeric(df[col], errors="coerce") > val).sum())
+                results.append({"column": col, "rule": f"max<={val}", "pass": fails == 0, "detail": f"{fails} above max"})
+            elif r == "regex" and val is not None:
+                import re
+                fails = int(~df[col].astype(str).str.match(str(val)).all())
+                results.append({"column": col, "rule": f"regex:{val}", "pass": fails == 0, "detail": f"{fails} non-matching"})
+
+        passed = sum(1 for r in results if r["pass"])
+        score = round(passed / len(results) * 100, 1) if results else 100.0
+        return {
+            "total_rules": len(results),
+            "passed": passed,
+            "failed": len(results) - passed,
+            "quality_score": score,
+            "overall_pass": score == 100.0,
+            "rule_results": results,
+        }
